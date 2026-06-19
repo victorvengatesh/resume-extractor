@@ -1,7 +1,12 @@
-import React, { useState, useRef } from "react";
+import React, { useState, useRef, useEffect, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { FiZap, FiTarget, FiCode, FiShield, FiUploadCloud, FiCopy } from "react-icons/fi";
 import "./App.css";
+
+/* ----------------------
+  API base URL
+------------------------*/
+const API = process.env.REACT_APP_API_URL || "https://resume-extractor-backend-ockg.onrender.com";
 
 /* ----------------------
   Utility helpers
@@ -26,8 +31,79 @@ export default function App() {
   const [error, setError] = useState(null);
   const inputRef = useRef(null);
 
+  // Backend wake-up state
+  const [backendReady, setBackendReady] = useState(false);
+  const [backendChecking, setBackendChecking] = useState(true);
+
   const MAX_FILE_BYTES = 12 * 1024 * 1024; // 12MB per file
 
+  /* ----------------------
+    Health-check ping on mount
+  ------------------------*/
+  const pingBackend = useCallback(async () => {
+    setBackendChecking(true);
+    try {
+      const res = await fetch(`${API}/health`, { method: "GET" });
+      if (res.ok) {
+        setBackendReady(true);
+        setBackendChecking(false);
+        return true;
+      }
+      setBackendReady(false);
+      setBackendChecking(false);
+      return false;
+    } catch {
+      setBackendReady(false);
+      setBackendChecking(false);
+      return false;
+    }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let retryTimer;
+
+    const check = async () => {
+      const ok = await pingBackend();
+      // If backend is cold, retry every 5 seconds until it wakes up
+      if (!ok && !cancelled) {
+        retryTimer = setInterval(async () => {
+          const ready = await pingBackend();
+          if (ready || cancelled) {
+            clearInterval(retryTimer);
+          }
+        }, 5000);
+      }
+    };
+
+    check();
+
+    return () => {
+      cancelled = true;
+      if (retryTimer) clearInterval(retryTimer);
+    };
+  }, [pingBackend]);
+
+  /* ----------------------
+    Fetch with retry logic
+  ------------------------*/
+  const fetchWithRetry = async (url, options, retries = 1) => {
+    try {
+      const res = await fetch(url, options);
+      return res;
+    } catch (err) {
+      if (retries > 0) {
+        setStatusMessage("Retrying...");
+        await new Promise((resolve) => setTimeout(resolve, 5000));
+        return fetchWithRetry(url, options, retries - 1);
+      }
+      throw err;
+    }
+  };
+
+  /* ----------------------
+    Batch upload handler
+  ------------------------*/
   const handleBatchUpload = async (e) => {
     setError(null);
     setStatusMessage("");
@@ -50,8 +126,8 @@ export default function App() {
 
     try {
       setStatusMessage("Uploading & analyzing resumes...");
-      const url = `${process.env.REACT_APP_API_URL || "http://127.0.0.1:8000"}/batch-analyze?job_role=${encodeURIComponent(jobRole)}`;
-      const res = await fetch(url, { method: "POST", body: formData });
+      const url = `${API}/batch-analyze?job_role=${encodeURIComponent(jobRole)}`;
+      const res = await fetchWithRetry(url, { method: "POST", body: formData });
       if (!res.ok) {
         const text = await res.text();
         throw new Error(text || `Server responded ${res.status}`);
@@ -88,6 +164,17 @@ export default function App() {
     document.getElementById('hero').scrollIntoView({ behavior: 'smooth' });
   };
 
+  // Determine if upload should be disabled
+  const uploadDisabled = loading || (!backendReady && backendChecking);
+
+  // Upload button label
+  const getUploadLabel = () => {
+    if (loading) return "Analyzing...";
+    if (!backendReady && backendChecking) return "Waking up backend...";
+    if (!backendReady) return "Backend offline — retry";
+    return "Batch Upload & Match";
+  };
+
   return (
     <div className="content-wrapper">
       <div className="ambient-glow"></div>
@@ -101,6 +188,22 @@ export default function App() {
           <a href="#features">Features</a>
           <a href="#docs">API Docs</a>
           <a href="#pricing">Pricing</a>
+
+          {/* Backend status indicator */}
+          <div className="backend-status">
+            <span
+              className={`status-dot ${
+                backendReady ? "status-ready" : backendChecking ? "status-waking" : "status-offline"
+              }`}
+            />
+            <span className="status-text">
+              {backendReady
+                ? "Ready"
+                : backendChecking
+                ? "Waking up... (~30s)"
+                : "Offline"}
+            </span>
+          </div>
         </div>
         <button className="btn-neon" onClick={scrollToHero}>
           Start Extracting <FiZap />
@@ -147,10 +250,27 @@ export default function App() {
               </div>
 
               <div style={{ display: "flex", gap: "1rem" }}>
-                <label className="btn-neon" style={{ flex: 1, justifyContent: "center", height: "48px", cursor: loading ? "not-allowed" : "pointer" }}>
+                <label
+                  className={`btn-neon ${uploadDisabled ? "btn-disabled" : ""}`}
+                  style={{
+                    flex: 1,
+                    justifyContent: "center",
+                    height: "48px",
+                    cursor: uploadDisabled ? "not-allowed" : "pointer",
+                    opacity: uploadDisabled ? 0.6 : 1,
+                  }}
+                >
                   <FiUploadCloud size={20} />
-                  {loading ? "Analyzing..." : "Batch Upload & Match"}
-                  <input ref={inputRef} type="file" multiple accept=".pdf,.docx,.txt" onChange={handleBatchUpload} style={{ display: "none" }} disabled={loading} />
+                  {getUploadLabel()}
+                  <input
+                    ref={inputRef}
+                    type="file"
+                    multiple
+                    accept=".pdf,.docx,.txt"
+                    onChange={handleBatchUpload}
+                    style={{ display: "none" }}
+                    disabled={uploadDisabled}
+                  />
                 </label>
               </div>
             </div>
@@ -160,6 +280,19 @@ export default function App() {
               <div>{statusMessage || "Upload PDF or DOCX"}</div>
               {error && <div style={{ color: "#ff4d4d", fontWeight: "bold" }}>{error}</div>}
             </div>
+
+            {/* Backend wake-up banner (shown only when cold) */}
+            {!backendReady && backendChecking && (
+              <motion.div
+                initial={{ opacity: 0, height: 0 }}
+                animate={{ opacity: 1, height: "auto" }}
+                exit={{ opacity: 0, height: 0 }}
+                className="wake-banner"
+              >
+                <span className="wake-spinner" />
+                Backend waking up... This may take ~30 seconds on free tier.
+              </motion.div>
+            )}
           </div>
         </motion.div>
       </section>
